@@ -1,4 +1,10 @@
-﻿using System;
+﻿using CsPotrace;
+using Fizzler;
+using Ionic.Zip;
+using Newtonsoft.Json;
+using Svg;
+using Svg.Transforms;
+using System;
 using System.Collections.Generic;
 using System.Drawing;
 using System.Drawing.Drawing2D;
@@ -12,13 +18,11 @@ using System.Runtime.Serialization;
 using System.Threading.Tasks;
 using System.Web;
 using System.Web.Http;
-using Ionic.Zip;
-using Newtonsoft.Json;
-using Svg;
-using Svg.Transforms;
+using System.Xml;
 
 namespace WWA.WebUI.Controllers
 {
+    #region input classes
     public class Profile
     {
         [DataMember(Name = "width")]
@@ -38,10 +42,15 @@ namespace WWA.WebUI.Controllers
 
         [DataMember(Name = "format")]
         public string Format { get; set; }
+
+        [DataMember(Name = "silhouette")]
+        public bool Silhouette { get; set; }
     }
+    #endregion
 
     public class ImageController : ApiController
     {
+        #region GET api/image
         public HttpResponseMessage Get(string id)
         {
             HttpResponseMessage httpResponseMessage;
@@ -90,8 +99,10 @@ namespace WWA.WebUI.Controllers
             config.Add(ReadStringFromConfigFile(filePath));
             return config;
         }
+        #endregion
 
-        // POST api/image
+
+        #region POST api/image
         public async Task<HttpResponseMessage> Post()
         {
             string root = HttpContext.Current.Server.MapPath("~/App_Data");
@@ -191,11 +202,12 @@ namespace WWA.WebUI.Controllers
                             iconObject.icons.Add(new IconObject(profile.Folder + profile.Name + "." + fmt, profile.Width + "x" + profile.Height));
                         }
 
-                        var iconStr = JsonConvert.SerializeObject(iconObject, Formatting.Indented);
+                        var iconStr = JsonConvert.SerializeObject(iconObject, Newtonsoft.Json.Formatting.Indented);
 
                         zip.AddEntry("icons.json", iconStr);
 
                         string zipFilePath = CreateFilePathFromId(zipId);
+
                         zip.Save(zipFilePath);
                     }
                 }
@@ -224,6 +236,7 @@ namespace WWA.WebUI.Controllers
 
             return responseMessage;
         }
+        #endregion
 
         private string CreateFilePathFromId(Guid id)
         {
@@ -232,9 +245,14 @@ namespace WWA.WebUI.Controllers
             return zipFilePath;
         }
 
+        #region image conversion
         private static Stream CreateImageStream(IconModel model, Profile profile)
         {
-            if (model.SvgFile != null)
+            if (profile.Silhouette == true)
+            {
+                return RenderSilhouetteSvg(model, profile);
+            }
+            else if (model.SvgFile != null)
             {
                 return RenderSvgToStream(model.SvgFile, profile.Width, profile.Height, profile.Format, model.Padding, model.Background);
             }
@@ -387,8 +405,282 @@ namespace WWA.WebUI.Controllers
 
             return memoryStream;
         }
-    }
 
+        /*
+            Handles paths concerning if the image is a raster or an svg.
+            Part 1
+            Raster:
+            - Convert image to bitmap
+            - Bitmap is iterated by pixel, background becomes white, all else becomes black
+            - Bitmap then is sent into Potrace and the svg is a text file that has been outputted.
+
+            SVG:
+            - Background color turned white, all else turned black.
+
+            Part 2
+            - white svg elements are set to transparent
+            - black svg elements are set to black
+
+         */
+        private static Stream RenderSilhouetteSvg(IconModel model, Profile profile)
+        {
+            XmlDocument document = new XmlDocument(); // In Memory representation of the SVG document, will be the output to the stream.
+            string svgFile = (model.SvgFile != null) ? model.SvgFile : null;
+            double paddingProp = (model.Padding == 0) ? model.Padding : 0.3;
+            int width = profile.Width;
+            int height = profile.Height;
+            // Prep the bit map by making background white and the rest of the colors black.
+
+            // Part 1
+            if (svgFile == null)
+            {
+                
+                width = model.InputImage.Size.Width;
+                height = model.InputImage.Size.Height;
+                int adjustWidth;
+                int adjustedHeight;
+                int paddingW;
+                int paddingH;
+                if (paddingProp > 0)
+                {
+                    paddingW = (int)(paddingProp * profile.Width * 0.5);
+                    adjustWidth = profile.Width - paddingW;
+                    paddingH = (int)(paddingProp * profile.Height * 0.5);
+                    adjustedHeight = profile.Height - paddingH;
+                }
+                else
+                {
+                    paddingW = paddingH = 0;
+                    adjustWidth = profile.Width;
+                    adjustedHeight = profile.Height;
+                }
+
+                double ratioW = (double)adjustWidth / width;
+                double ratioH = (double)adjustedHeight / height;
+
+                double scaleFactor = ratioH > ratioW ? ratioW : ratioH;
+
+                var scaledHeight = (int)(height * scaleFactor);
+                var scaledWidth = (int)(width * scaleFactor);
+
+                double originX = ratioH > ratioW ? paddingW * 0.5 : profile.Width * 0.5 - scaledWidth * 0.5;
+                double originY = ratioH > ratioW ? profile.Height * 0.5 - scaledHeight * 0.5 : paddingH * 0.5;
+
+                // 1. Convert to bitmap
+                Bitmap original = new Bitmap(model.InputImage);
+                Bitmap bitmap = new Bitmap(profile.Width, profile.Height, original.PixelFormat);
+
+                Color toWhite = model.Background != null ? (Color)model.Background : original.GetPixel(0, 0);
+
+                Graphics g = Graphics.FromImage(bitmap);
+                g.InterpolationMode = InterpolationMode.HighQualityBicubic;
+                g.SmoothingMode = SmoothingMode.HighQuality;
+                g.PixelOffsetMode = PixelOffsetMode.HighQuality;
+                g.CompositingQuality = CompositingQuality.HighQuality;
+
+                g.Clear(toWhite);
+
+                var dstRect = new Rectangle((int)originX, (int)originY, scaledWidth, scaledHeight);
+
+                using (var ia = new ImageAttributes())
+                {
+                    using (var image = model.InputImage)
+                    {
+                        ia.SetWrapMode(WrapMode.TileFlipXY);
+                        g.DrawImage(image, dstRect, 0, 0, image.Width, image.Height, GraphicsUnit.Pixel, ia);
+                    }
+                }
+
+                // 2. Convert background color and white to white, all else to black
+                Color c;
+                for (int x = 0; x < bitmap.Width; x++)
+                {
+                    for (int y = 0; y < bitmap.Height; y++)
+                    {
+                        c = bitmap.GetPixel(x, y);
+
+                        // assumption built in, where background needs to be white for potrace, white is kept white, not sure about light grays atm.
+                        if (c.Equals(toWhite) || c.Equals(Color.White))
+                        {
+                            bitmap.SetPixel(x, y, Color.White);
+                        } else
+                        {
+                            bitmap.SetPixel(x, y, Color.Black);
+                        }
+                    }
+                }
+
+                List<List<Curve>> traces = new List<List<Curve>>(); //ignore this output, intended for the GUI
+                Potrace.Potrace_Trace(bitmap, traces);
+
+                //SVG
+                string svgFileContent = Potrace.getSVG();
+                document.LoadXml(svgFileContent);
+            
+                // The way it CSPotrace is set up the internal representations need to be manually cleared.
+                Potrace.Clear();
+
+            } else
+            {
+                /*
+                    SVG Path
+                 */
+                // 1. Resize document nodes send this output to stream into the XMLDocument.
+                SvgDocument svgDoc = SvgDocument.Open(model.SvgFile);
+                float oldWidth = 0f;
+                float oldHeight = 0f;
+
+                try
+                {
+                    oldWidth = svgDoc.GetDimensions().Width;
+                    oldHeight = svgDoc.GetDimensions().Height;
+                } catch (Exception ex) { }
+
+                if (oldWidth == 0f)
+                {
+                    XmlNode firstRect = document.SelectSingleNode("rect");
+                    oldWidth = float.Parse(firstRect.Attributes["width"].Value);
+                    oldHeight = float.Parse(firstRect.Attributes["height"].Value);
+
+                    if (oldWidth == 0f)
+                    {
+                        throw new Exception("SVG does not have size specified. Cannot work with it.");
+                    }
+                }
+
+                float newRatio = (height * 1.0f) / width;
+                float oldRatio = oldHeight / oldWidth;
+                float scalingFactor = 1f;
+                int padding = 0;
+                if (newRatio > oldRatio)
+                {
+                    padding = (int)(paddingProp * oldWidth * 0.5);
+                    scalingFactor = ((width - padding * 2) * 1.0f) / oldWidth;
+                } else
+                {
+                    padding = (int)(paddingProp * oldHeight * 0.5);
+                    scalingFactor = ((height - padding * 2) * 1.0f) / oldHeight;
+                }
+
+                /*
+                    1. Traverse XML and build queue of elements to convert to black and white.
+                 */
+                // Read the SVG document as XML in memory
+                Color toWhite = model.Background != null ? (Color)model.Background : Color.White;
+
+                document.LoadXml(svgDoc.GetXML());
+
+                // DFS
+                Queue<XmlNode> queue = traverseSvgNodes(ref document, (XmlNode node) => { return isGraphicalElement(node) || isContainerElement(node); });
+
+                // grab background element, change to white
+                foreach (XmlNode graphicalElement in queue)
+                {
+                    string fillColor = graphicalElement.Attributes["fill"].Value;
+
+                    if (fillColor.Equals(ColorTranslator.ToHtml(toWhite)) || fillColor.Equals(ColorTranslator.ToHtml(Color.White))) {
+                        graphicalElement.Attributes["fill"].Value = "#ffffff";
+                    }
+                    else
+                    {
+                        graphicalElement.Attributes["fill"].Value = "#000000";
+                    }
+                }
+            }
+
+            /*
+                Part 2 - change background to transparent and the silhouette nodes to white.
+             */
+            //convert white nodes to transparent, convert black nodes to white (silhouette color).
+            var stream = new MemoryStream();
+
+            Queue<XmlNode> toTransparent = traverseSvgNodes(ref document, 
+                (XmlNode node) => { return node.Attributes["fill"] != null && (node.Attributes["fill"].Value == "#ffffff" || node.Attributes["fill"].Value == "white"); });
+            Queue<XmlNode> silhouetteQueue = traverseSvgNodes(ref document, 
+                (XmlNode node) => { return node.Attributes["fill"] != null && (node.Attributes["fill"].Value == "#000000" || node.Attributes["fill"].Value == "black"); });
+
+            foreach (XmlNode node in toTransparent)
+            {
+                node.Attributes["fill"].Value = "transparent";
+            }
+
+            foreach (XmlNode node in silhouetteQueue)
+            {
+                node.Attributes["fill"].Value = "#ffffff";
+            }
+
+            document.Save(stream);
+
+            return stream;
+        }
+
+        #region SvgAsXml
+        static private HashSet<string> graphicalElements = new HashSet<string>(new string[] {
+                    "circle",
+                    "ellipse",
+                    "line",
+                    "path",
+                    "polygon",
+                    "polyline",
+                    "rect",
+                    "text",
+                    "use"
+        });
+
+        static private HashSet<string> containerElements = new HashSet<string>(new string[] {
+                    "defs",
+                    "g",
+                    "marker",
+                    "mask",
+                    "pattern",
+                    "switch",
+                    "symbol"
+        });
+
+        private static bool isGraphicalElement(XmlNode node)
+        {
+            return graphicalElements.Contains(node.Name);
+        }
+
+        private static bool isContainerElement(XmlNode node)
+        {
+            return containerElements.Contains(node.Name);
+        }
+
+        private static Queue<XmlNode> traverseSvgNodes(ref XmlDocument document, Func<XmlNode, bool> condition)
+        {
+            Queue<XmlNode> edits = new Queue<XmlNode>();
+
+            foreach (XmlNode svg in document.GetElementsByTagName("svg"))
+            {
+                traverseSvgNodesRecursive(ref edits, in svg, condition);
+            }
+
+            return edits;
+        }
+
+        private static void traverseSvgNodesRecursive(ref Queue<XmlNode> queue, in XmlNode node, Func<XmlNode, bool> condition)
+        {
+            if (condition(node))
+            {
+                queue.Enqueue(node);
+            }
+
+            if (node.HasChildNodes)
+            {
+                foreach (XmlNode childNode in node.ChildNodes)
+                {
+                    traverseSvgNodesRecursive(ref queue, childNode, condition);
+                }
+            }
+        }
+      
+        #endregion
+    }
+    #endregion
+
+
+    #region output classes
     public class IconModel: IDisposable
     {
         private bool disposed = false;
@@ -448,4 +740,5 @@ namespace WWA.WebUI.Controllers
     {
         public List<IconObject> icons { get; set; } = new List<IconObject>();
     }
+    #endregion
 }
